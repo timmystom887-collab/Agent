@@ -1,0 +1,6 @@
+{
+  "name": "Agent Smith",
+  "description": "Autonomous Matrix Agent with multi-agent swarms, IVR phone navigation, proactive cognition, second-brain memory, and local tools.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
