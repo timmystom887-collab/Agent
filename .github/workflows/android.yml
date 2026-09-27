@@ -1,0 +1,128 @@
+name: Build Android APKs
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+    inputs:
+      build_variant:
+        description: 'Build variant (debug, release, or both)'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - debug
+          - release
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & Verify Android APKs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up JDK 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept Android SDK Licenses
+        run: |
+          yes | sdkmanager --licenses || true
+
+      - name: Grant Execute Permission to Gradle Wrapper
+        run: chmod +x gradlew
+
+      - name: Prepare Environment Configuration (.env)
+        run: |
+          if [ ! -f .env ] && [ -f .env.example ]; then
+            cp .env.example .env
+            echo "Copied .env.example to .env for build process"
+          fi
+          if [ -n "${{ secrets.GEMINI_API_KEY }}" ]; then
+            echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> .env
+          fi
+
+      - name: Prepare Keystores for Signing
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          # 1. Debug Keystore: Restore from base64 if present, or generate standard debug keystore
+          if [ -f debug.keystore.base64 ] && [ ! -f debug.keystore ]; then
+            echo "Restoring debug.keystore from debug.keystore.base64..."
+            base64 -d debug.keystore.base64 > debug.keystore
+          elif [ ! -f debug.keystore ]; then
+            echo "Generating standard debug.keystore..."
+            keytool -genkey -v -keystore debug.keystore -storepass android \
+              -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 \
+              -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+          # 2. Release Keystore: Decode if secret is provided, otherwise generate valid self-signed upload key
+          # This ensures the release build passes on the first run even if user has not yet configured repository secrets.
+          if [ -n "$RELEASE_KEYSTORE_BASE64" ]; then
+            echo "Decoding release keystore from GitHub Secrets..."
+            echo "$RELEASE_KEYSTORE_BASE64" | base64 -d > my-upload-key.jks
+          elif [ ! -f my-upload-key.jks ]; then
+            echo "Creating self-signed upload keystore fallback for release build..."
+            keytool -genkey -v -keystore my-upload-key.jks -storepass android \
+              -alias upload -keypass android -keyalg RSA -keysize 2048 \
+              -validity 10000 -dname "CN=Android Release,O=Android,C=US"
+            echo "FALLBACK_STORE_PASS=android" >> $GITHUB_ENV
+            echo "FALLBACK_KEY_PASS=android" >> $GITHUB_ENV
+          fi
+
+      - name: Run Unit & Robolectric Tests
+        run: ./gradlew testDebugUnitTest --no-daemon --stacktrace
+
+      - name: Build Debug APK
+        if: ${{ github.event.inputs.build_variant == 'both' || github.event.inputs.build_variant == 'debug' || github.event_name != 'workflow_dispatch' }}
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Build Release APK
+        if: ${{ github.event.inputs.build_variant == 'both' || github.event.inputs.build_variant == 'release' || github.event_name != 'workflow_dispatch' }}
+        env:
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD || env.FALLBACK_STORE_PASS || 'android' }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || env.FALLBACK_KEY_PASS || 'android' }}
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Upload Debug APK
+        if: always() && hashFiles('app/build/outputs/apk/debug/*.apk') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 30
+
+      - name: Upload Release APK
+        if: always() && hashFiles('app/build/outputs/apk/release/*.apk') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-apk
+          path: app/build/outputs/apk/release/*.apk
+          retention-days: 30
+
+      - name: Upload Test Results
+        if: always() && hashFiles('app/build/reports/tests/**') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: app/build/reports/tests/
+          retention-days: 7
